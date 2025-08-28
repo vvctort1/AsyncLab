@@ -23,12 +23,24 @@ string baseDir = Directory.GetCurrentDirectory();
 string tempCsvPath = Path.Combine(baseDir, "municipios.csv");
 string outRoot = Path.Combine(baseDir, OUT_DIR_NAME);
 
-Console.WriteLine("Baixando CSV de municípios (Receita Federal) ...");
-using (var wc = new WebClient())
+
+// Verifica se o arquivo já existe
+if (!File.Exists(tempCsvPath))
 {
-    wc.Encoding = Encoding.UTF8; // ajuste para ISO-8859-1 se necessário
-    wc.DownloadFile(CSV_URL, tempCsvPath);
+
+    Console.WriteLine("Baixando CSV de municípios (Receita Federal) ...");
+    using (var httpClient = new HttpClient())
+    {
+        var data = await httpClient.GetStringAsync(CSV_URL);
+        await File.WriteAllTextAsync(tempCsvPath, data, Encoding.UTF8);
+    }
 }
+else
+{
+
+    Console.WriteLine("O arquivo CSV já foi baixado.");
+}
+
 
 Console.WriteLine("Lendo e parseando o CSV ...");
 var linhas = File.ReadAllLines(tempCsvPath, Encoding.UTF8);
@@ -46,24 +58,36 @@ if (linhas[0].IndexOf("IBGE", StringComparison.OrdinalIgnoreCase) >= 0 ||
 }
 
 var municipios = new List<Municipio>(linhas.Length - startIndex);
+var tasks = new List<Task>();
 
 for (int i = startIndex; i < linhas.Length; i++)
 {
-    var linha = (linhas[i] ?? "").Trim();
-    if (string.IsNullOrWhiteSpace(linha)) continue;
-
-    var parts = linha.Split(';');
-    if (parts.Length < 5) continue;
-
-    municipios.Add(new Municipio
+    int index = i; // Captura variável de loop para usar dentro da Task
+    tasks.Add(Task.Run(() =>
     {
-        Tom = Util.San(parts[0]),
-        Ibge = Util.San(parts[1]),
-        NomeTom = Util.San(parts[2]),
-        NomeIbge = Util.San(parts[3]),
-        Uf = Util.San(parts[4]).ToUpperInvariant()
-    });
+        var linha = (linhas[index] ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(linha)) return;
+
+        var parts = linha.Split(';');
+        if (parts.Length < 5) return;
+
+        var municipio = new Municipio
+        {
+            Tom = Util.San(parts[0]),
+            Ibge = Util.San(parts[1]),
+            NomeTom = Util.San(parts[2]),
+            NomeIbge = Util.San(parts[3]),
+            Uf = Util.San(parts[4]).ToUpperInvariant()
+        };
+
+        lock (municipios) // Protege a lista de acesso concorrente
+        {
+            municipios.Add(municipio);
+        }
+    }));
 }
+
+await Task.WhenAll(tasks); // Aguarda todas as tarefas terminarem
 
 Console.WriteLine($"Registros lidos: {municipios.Count}");
 
@@ -103,8 +127,9 @@ foreach (var uf in ufsOrdenadas)
 
         var listaJson = new List<object>();
         int count = 0;
-        foreach (var m in listaUf)
+        Parallel.ForEach(listaUf, m =>
         {
+
             // Password: todos os campos concatenados; Salt: IBGE + “pepper” fixo (opcional)
             string password = m.ToConcatenatedString();
             byte[] salt = Util.BuildSalt(m.Ibge);
@@ -114,7 +139,8 @@ foreach (var uf in ufsOrdenadas)
 
             swOut.WriteLine($"{m.Tom};{m.Ibge};{m.NomeTom};{m.NomeIbge};{m.Uf};{hashHex}");
 
-            listaJson.Add(new {
+            listaJson.Add(new
+            {
                 m.Tom,
                 m.Ibge,
                 m.NomeTom,
@@ -128,7 +154,7 @@ foreach (var uf in ufsOrdenadas)
             {
                 Console.WriteLine($"  Parcial: {count}/{listaUf.Count} municípios processados para UF {uf} | Tempo parcial: {FormatTempo(swUf.ElapsedMilliseconds)}");
             }
-        }
+        });
         // Salva JSON
         string jsonPath = Path.Combine(outRoot, $"municipios_hash_{uf}.json");
         var json = JsonSerializer.Serialize(listaJson, new JsonSerializerOptions { WriteIndented = true });
